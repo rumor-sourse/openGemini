@@ -1,6 +1,8 @@
 module github.com/openGemini/openGemini
 
-go 1.20
+go 1.21
+
+toolchain go1.21.12
 
 require (
 	github.com/BurntSushi/toml v0.4.1
@@ -48,6 +50,7 @@ require (
 	github.com/stretchr/testify v1.9.0
 	github.com/tinylib/msgp v1.1.8
 	github.com/valyala/fastjson v1.6.4
+	github.com/vbauerster/mpb/v7 v7.3.2
 	github.com/xlab/treeprint v1.2.0
 	go.etcd.io/bbolt v1.3.8
 	go.etcd.io/etcd/raft/v3 v3.5.10
@@ -75,6 +78,8 @@ require (
 	github.com/Masterminds/sprig/v3 v3.2.1 // indirect
 	github.com/VictoriaMetrics/metrics v1.18.0 // indirect
 	github.com/VictoriaMetrics/metricsql v0.26.0 // indirect
+	github.com/VividCortex/ewma v1.2.0 // indirect
+	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d // indirect
 	github.com/alecthomas/units v0.0.0-20210208195552-ff826a37aa15 // indirect
 	github.com/andreyvit/diff v0.0.0-20170406064948-c7f18ee00883 // indirect
 	github.com/aokoli/goutils v1.0.1 // indirect
