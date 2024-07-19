@@ -198,6 +198,7 @@ func (d *DatabaseDiskInfo) init(actualDataDir string, actualWalDir string, datab
 const stdOtuMark = "-"
 
 type Exporter struct {
+	exportFormat      string
 	databases         string
 	databaseDiskInfos []*DatabaseDiskInfo
 	actualDataPath    string
@@ -207,12 +208,13 @@ type Exporter struct {
 	filter            *LineFilter
 	compress          bool
 	lineCount         uint64
+	Parser
 
 	stderrLogger  *log.Logger
 	stdoutLogger  *log.Logger
 	defaultLogger *log.Logger
 
-	manifest                        map[string]struct{}                      // {dbName:rpName, struct{}}
+	manifest                        map[string]struct{}                      // {dbName:rpName, struct{}{}}
 	rpNameToMeasurementTsspFilesMap map[string]map[string][]string           // {dbName:rpName, {measurementName, tssp file absolute path}}
 	rpNameToIdToIndexMap            map[string]map[uint64]*tsi.MergeSetIndex // {dbName:rpName, {indexId, *mergeSetIndex}}
 	rpNameToWalFilesMap             map[string][]string                      // {dbName:rpName:shardDurationRange, index file absolute path}
@@ -325,6 +327,12 @@ func (e *Exporter) parseDatabaseInfos() error {
 
 // Init inits the Exporter instance ues CommandLineConfig specific by user
 func (e *Exporter) Init(clc *CommandLineConfig) error {
+	e.exportFormat = clc.Format
+	if e.exportFormat == "csv" {
+		e.Parser = &CsvParser{}
+	} else if e.exportFormat == "txt" {
+		e.Parser = &TxtParser{}
+	}
 	e.databases = clc.DBFilter
 	e.retentions = clc.Retentions
 	e.outPutPath = clc.Out
@@ -605,8 +613,10 @@ func (e *Exporter) writeDML(metaWriter io.Writer, outputWriter io.Writer) error 
 func (e *Exporter) writeAllTsspFilesInRp(metaWriter io.Writer, outputWriter io.Writer, measurementFilesMap map[string][]string, indexesMap map[uint64]*tsi.MergeSetIndex) error {
 	fmt.Fprintf(metaWriter, "# FROM TSSP FILE.\n\n")
 	var isOrder bool
+	hasWrittenMstInfo := make(map[string]bool)
 	for measurementName, files := range measurementFilesMap {
 		fmt.Fprintf(metaWriter, "# CONTEXT-MEASUREMENT: %s \n", measurementName)
+		hasWrittenMstInfo[measurementName] = false
 		for _, file := range files {
 			splits := strings.Split(file, string(os.PathSeparator))
 			var shardDir string
@@ -622,6 +632,12 @@ func (e *Exporter) writeAllTsspFilesInRp(metaWriter io.Writer, outputWriter io.W
 			_, indexId, err := parseShardDir(shardDir)
 			if err != nil {
 				return err
+			}
+			if !hasWrittenMstInfo[measurementName] {
+				if err := e.Parser.WriteMstInfo(metaWriter, outputWriter, file, isOrder, indexesMap[indexId]); err != nil {
+					return err
+				}
+				hasWrittenMstInfo[measurementName] = true
 			}
 			if err := e.writeSingleTsspFile(file, outputWriter, indexesMap[indexId], isOrder); err != nil {
 				return err
@@ -692,7 +708,7 @@ func (e *Exporter) writeSeriesRecords(outputWriter io.Writer, sid uint64, rec *r
 		}
 		if sIndex >= 1 {
 			bufSeries := influx.GetBytesBuffer()
-			bufSeries, err = Parse2SeriesKeyWithoutVersion(seriesKeys[i], bufSeries, false)
+			bufSeries, err = e.Parser.Parse2SeriesKeyWithoutVersion(seriesKeys[i], bufSeries, false)
 			if err != nil {
 				return err
 			}
@@ -701,7 +717,7 @@ func (e *Exporter) writeSeriesRecords(outputWriter io.Writer, sid uint64, rec *r
 			if series[sIndex] == nil {
 				series[sIndex] = influx.GetBytesBuffer()
 			}
-			series[sIndex], err = Parse2SeriesKeyWithoutVersion(seriesKeys[i], series[sIndex][:0], false)
+			series[sIndex], err = e.Parser.Parse2SeriesKeyWithoutVersion(seriesKeys[i], series[sIndex][:0], false)
 			if err != nil {
 				return err
 			}
@@ -727,40 +743,46 @@ func (e *Exporter) writeSingleRecord(outputWriter io.Writer, seriesKey [][]byte,
 	if !e.filter.filter(tm) {
 		return buf, nil
 	}
-
 	buf = bytes.Join(seriesKey, []byte(","))
 	buf = append(buf, ' ')
-	for i, field := range rec.Schema {
-		if field.Name == "time" {
-			continue
-		}
-		buf = append(buf, EscapeFieldKey(field.Name)+"="...)
-		switch field.Type {
-		case influx.Field_Type_Float:
-			buf = strconv.AppendFloat(buf, rec.Column(i).FloatValues()[0], 'g', -1, 64)
-		case influx.Field_Type_Int:
-			buf = strconv.AppendInt(buf, rec.Column(i).IntegerValues()[0], 10)
-			buf = append(buf, 'i')
-		case influx.Field_Type_Boolean:
-			buf = strconv.AppendBool(buf, rec.Column(i).BooleanValues()[0])
-		case influx.Field_Type_String:
-			var str []string
-			str = rec.Column(i).StringValues(str)
-			buf = append(buf, '"')
-			buf = append(buf, EscapeStringFieldValue(str[0])...)
-			buf = append(buf, '"')
-		default:
-			// This shouldn't be possible, but we'll format it anyway.
-			buf = append(buf, fmt.Sprintf("%v", rec.Column(i))...)
-		}
-		if i != rec.Len()-2 {
-			buf = append(buf, ',')
-		} else {
-			buf = append(buf, ' ')
-		}
+	buf, err := e.Parser.AppendFields(rec, buf)
+	if err != nil {
+		return nil, err
 	}
-	buf = strconv.AppendInt(buf, tm, 10)
-	buf = append(buf, '\n')
+	/*
+		for i, field := range rec.Schema {
+			if field.Name == "time" {
+				continue
+			}
+			buf = append(buf, EscapeFieldKey(field.Name)+"="...)
+			switch field.Type {
+			case influx.Field_Type_Float:
+				buf = strconv.AppendFloat(buf, rec.Column(i).FloatValues()[0], 'g', -1, 64)
+			case influx.Field_Type_Int:
+				buf = strconv.AppendInt(buf, rec.Column(i).IntegerValues()[0], 10)
+				buf = append(buf, 'i')
+			case influx.Field_Type_Boolean:
+				buf = strconv.AppendBool(buf, rec.Column(i).BooleanValues()[0])
+			case influx.Field_Type_String:
+				var str []string
+				str = rec.Column(i).StringValues(str)
+				buf = append(buf, '"')
+				buf = append(buf, EscapeStringFieldValue(str[0])...)
+				buf = append(buf, '"')
+			default:
+				// This shouldn't be possible, but we'll format it anyway.
+				buf = append(buf, fmt.Sprintf("%v", rec.Column(i))...)
+			}
+			if i != rec.Len()-2 {
+				buf = append(buf, ',')
+			} else {
+				buf = append(buf, ' ')
+			}
+		}
+		buf = strconv.AppendInt(buf, tm, 10)
+		buf = append(buf, '\n')
+
+	*/
 	if _, err := outputWriter.Write(buf); err != nil {
 		return buf, err
 	}
@@ -787,10 +809,10 @@ func (e *Exporter) writeSingleWalFile(file string, outputWriter io.Writer) error
 	priority := fileops.FilePriorityOption(fileops.IO_PRIORITY_NORMAL)
 	fd, err := fileops.OpenFile(file, os.O_RDONLY, 0640, lockPath, priority)
 	defer util.MustClose(fd)
-
 	if err != nil {
 		return err
 	}
+
 	stat, err := fd.Stat()
 	if err != nil {
 		return err
@@ -938,12 +960,20 @@ func (e *Exporter) writeSingleRow(row influx.Row, outputWriter io.Writer, buf []
 	return buf, nil
 }
 
+type Parser interface {
+	Parse2SeriesKeyWithoutVersion(key []byte, dst []byte, splitWithNull bool) ([]byte, error)
+	AppendFields(rec record.Record, buf []byte) ([]byte, error)
+	WriteMstInfo(metaWriter io.Writer, outputWriter io.Writer, filePath string, isOrder bool, index *tsi.MergeSetIndex) error
+}
+
+type TxtParser struct{}
+type CsvParser struct{}
+
 // Parse2SeriesKeyWithoutVersion parse encoded index key to line protocol series key,without version and escape special characters
 // encoded index key format: [total len][ms len][ms][tagkey1 len][tagkey1 val]...]
 // parse to line protocol format: mst,tagkey1=tagval1,tagkey2=tagval2...
-func Parse2SeriesKeyWithoutVersion(key []byte, dst []byte, splitWithNull bool) ([]byte, error) {
+func (T *TxtParser) Parse2SeriesKeyWithoutVersion(key []byte, dst []byte, splitWithNull bool) ([]byte, error) {
 	msName, src, err := influx.MeasurementName(key)
-	// 转义mstName
 	originMstName := influx.GetOriginMstName(string(msName))
 	originMstName = EscapeMstName(originMstName)
 	if err != nil {
@@ -977,6 +1007,205 @@ func Parse2SeriesKeyWithoutVersion(key []byte, dst []byte, splitWithNull bool) (
 		src = src[valLen:]
 	}
 	return dst[:len(dst)-1], nil
+}
+
+func (T *TxtParser) AppendFields(rec record.Record, buf []byte) ([]byte, error) {
+	for i, field := range rec.Schema {
+		if field.Name == "time" {
+			continue
+		}
+		buf = append(buf, EscapeFieldKey(field.Name)+"="...)
+		switch field.Type {
+		case influx.Field_Type_Float:
+			buf = strconv.AppendFloat(buf, rec.Column(i).FloatValues()[0], 'g', -1, 64)
+		case influx.Field_Type_Int:
+			buf = strconv.AppendInt(buf, rec.Column(i).IntegerValues()[0], 10)
+			buf = append(buf, 'i')
+		case influx.Field_Type_Boolean:
+			buf = strconv.AppendBool(buf, rec.Column(i).BooleanValues()[0])
+		case influx.Field_Type_String:
+			var str []string
+			str = rec.Column(i).StringValues(str)
+			buf = append(buf, '"')
+			buf = append(buf, EscapeStringFieldValue(str[0])...)
+			buf = append(buf, '"')
+		default:
+			// This shouldn't be possible, but we'll format it anyway.
+			buf = append(buf, fmt.Sprintf("%v", rec.Column(i))...)
+		}
+		if i != rec.Len()-2 {
+			buf = append(buf, ',')
+		} else {
+			buf = append(buf, ' ')
+		}
+	}
+	buf = strconv.AppendInt(buf, rec.Times()[0], 10)
+	buf = append(buf, '\n')
+	return buf, nil
+}
+
+func (T *TxtParser) WriteMstInfo(metaWriter io.Writer, _ io.Writer, filePath string, isOrder bool, index *tsi.MergeSetIndex) error {
+	lockPath := ""
+	tsspFile, err := immutable.OpenTSSPFile(filePath, &lockPath, isOrder, false)
+	defer util.MustClose(tsspFile)
+	if err != nil {
+		return err
+	}
+	fi := immutable.NewFileIterator(tsspFile, immutable.CLog)
+	itr := immutable.NewChunkIterator(fi)
+	itr.Next()
+	sid := itr.GetSeriesID()
+	if sid == 0 {
+		return fmt.Errorf("series ID is zero")
+	}
+	rec := itr.GetRecord()
+	record.CheckRecord(rec)
+	var combineKey []byte
+	var seriesKeys [][]byte
+	var isExpectSeries []bool
+	// Use sid get series key's []byte
+	if seriesKeys, _, isExpectSeries, err = index.SearchSeriesWithTagArray(sid, seriesKeys, nil, combineKey, isExpectSeries, nil); err != nil {
+		return err
+	}
+	_, src, err := influx.MeasurementName(seriesKeys[0])
+	tagsN := encoding.UnmarshalUint16(src)
+	src = src[2:]
+	var i uint16
+	var tags []string
+	for i = 0; i < tagsN; i++ {
+		keyLen := encoding.UnmarshalUint16(src)
+		src = src[2:]
+		tagKey := EscapeTagKey(string(src[:keyLen]))
+		tags = append(tags, tagKey)
+		src = src[keyLen:]
+
+		valLen := encoding.UnmarshalUint16(src)
+		src = src[2:]
+		src = src[valLen:]
+	}
+	fmt.Fprintf(metaWriter, "# CONTEXT-TAGS: %s \n", strings.Join(tags, ","))
+	return nil
+}
+
+// Parse2SeriesKeyWithoutVersion parse encoded index key to csv series key,without version and escape special characters
+// encoded index key format: [total len][ms len][ms][tagkey1 len][tagkey1 val]...]
+// parse to csv format: mst,tagval1,tagval2...
+func (C *CsvParser) Parse2SeriesKeyWithoutVersion(key []byte, dst []byte, splitWithNull bool) ([]byte, error) {
+	msName, src, err := influx.MeasurementName(key)
+	originMstName := influx.GetOriginMstName(string(msName))
+	originMstName = EscapeMstName(originMstName)
+	if err != nil {
+		return []byte{}, err
+	}
+	var split [2]byte
+	if splitWithNull {
+		split[0], split[1] = influx.ByteSplit, influx.ByteSplit
+	} else {
+		split[0], split[1] = '=', ','
+	}
+
+	tagsN := encoding.UnmarshalUint16(src)
+	src = src[2:]
+	var i uint16
+	for i = 0; i < tagsN; i++ {
+		keyLen := encoding.UnmarshalUint16(src)
+		src = src[2:]
+		src = src[keyLen:]
+
+		valLen := encoding.UnmarshalUint16(src)
+		src = src[2:]
+		tagVal := EscapeTagValue(string(src[:valLen]))
+		dst = append(dst, tagVal...)
+		dst = append(dst, split[1])
+		src = src[valLen:]
+	}
+	return dst[:len(dst)], nil
+
+}
+
+func (C *CsvParser) AppendFields(rec record.Record, buf []byte) ([]byte, error) {
+	for i, field := range rec.Schema {
+		if field.Name == "time" {
+			continue
+		}
+		switch field.Type {
+		case influx.Field_Type_Float:
+			buf = strconv.AppendFloat(buf, rec.Column(i).FloatValues()[0], 'g', -1, 64)
+		case influx.Field_Type_Int:
+			buf = strconv.AppendInt(buf, rec.Column(i).IntegerValues()[0], 10)
+			buf = append(buf, 'i')
+		case influx.Field_Type_Boolean:
+			buf = strconv.AppendBool(buf, rec.Column(i).BooleanValues()[0])
+		case influx.Field_Type_String:
+			var str []string
+			str = rec.Column(i).StringValues(str)
+			buf = append(buf, '"')
+			buf = append(buf, EscapeStringFieldValue(str[0])...)
+			buf = append(buf, '"')
+		default:
+			// This shouldn't be possible, but we'll format it anyway.
+			buf = append(buf, fmt.Sprintf("%v", rec.Column(i))...)
+		}
+		buf = append(buf, ',')
+	}
+	buf = strconv.AppendInt(buf, rec.Times()[0], 10)
+	buf = append(buf, '\n')
+	return buf, nil
+}
+
+func (C *CsvParser) WriteMstInfo(metaWriter io.Writer, outputWriter io.Writer, filePath string, isOrder bool, index *tsi.MergeSetIndex) error {
+	lockPath := ""
+	tsspFile, err := immutable.OpenTSSPFile(filePath, &lockPath, isOrder, false)
+	defer util.MustClose(tsspFile)
+	if err != nil {
+		return err
+	}
+	fi := immutable.NewFileIterator(tsspFile, immutable.CLog)
+	itr := immutable.NewChunkIterator(fi)
+	itr.Next()
+	sid := itr.GetSeriesID()
+	if sid == 0 {
+		return fmt.Errorf("series ID is zero")
+	}
+	rec := itr.GetRecord()
+	record.CheckRecord(rec)
+	var combineKey []byte
+	var seriesKeys [][]byte
+	var isExpectSeries []bool
+	// Use sid get series key's []byte
+	if seriesKeys, _, isExpectSeries, err = index.SearchSeriesWithTagArray(sid, seriesKeys, nil, combineKey, isExpectSeries, nil); err != nil {
+		return err
+	}
+	_, src, err := influx.MeasurementName(seriesKeys[0])
+	tagsN := encoding.UnmarshalUint16(src)
+	src = src[2:]
+	var i uint16
+	var tags, fields []string
+	for i = 0; i < tagsN; i++ {
+		keyLen := encoding.UnmarshalUint16(src)
+		src = src[2:]
+		tagKey := EscapeTagKey(string(src[:keyLen]))
+		tags = append(tags, tagKey)
+		src = src[keyLen:]
+
+		valLen := encoding.UnmarshalUint16(src)
+		src = src[2:]
+		src = src[valLen:]
+	}
+	for _, field := range rec.Schema {
+		fields = append(fields, field.Name)
+	}
+	fmt.Fprintf(metaWriter, "# CONTEXT-TAGS: %s \n", strings.Join(tags, ";"))
+	buf := influx.GetBytesBuffer()
+	buf = append(buf, strings.Join(tags, ",")...)
+	buf = append(buf, ',')
+	buf = append(buf, strings.Join(fields, ",")...)
+	buf = append(buf, '\n')
+	_, err = outputWriter.Write(buf)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func parseShardDir(shardDirName string) (uint64, uint64, error) {

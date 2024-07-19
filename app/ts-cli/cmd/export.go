@@ -21,7 +21,8 @@ func init() {
 	exportCmd.Flags().StringVar(&options.MeasurementFilter, "mstfilter", "", "Optional.Measurements to export.eg. mst1,mst2")
 	exportCmd.Flags().StringVar(&options.TimeFilter, "timefilter", "", "Optional.Export time range, support 'start~end'")
 	exportCmd.Flags().BoolVar(&options.Compress, "compress", false, "Optional. Compress the export output.")
-	err := exportCmd.MarkFlagRequired("out")
+	err := exportCmd.MarkFlagRequired("format")
+	err = exportCmd.MarkFlagRequired("out")
 	if err != nil {
 		return
 	}
