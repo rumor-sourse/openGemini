@@ -34,6 +34,8 @@ import (
 const (
 	tsspFileExtension = "tssp"
 	walFileExtension  = "wal"
+	csvFormatExporter = "csv"
+	txtFormatExporter = "txt"
 	dirNameSeparator  = "_"
 	writerBufferSize  = 1024 * 1024
 )
@@ -328,9 +330,9 @@ func (e *Exporter) parseDatabaseInfos() error {
 // Init inits the Exporter instance ues CommandLineConfig specific by user
 func (e *Exporter) Init(clc *CommandLineConfig) error {
 	e.exportFormat = clc.Format
-	if e.exportFormat == "csv" {
+	if e.exportFormat == csvFormatExporter {
 		e.Parser = &CsvParser{}
-	} else if e.exportFormat == "txt" {
+	} else if e.exportFormat == txtFormatExporter {
 		e.Parser = &TxtParser{}
 	}
 	e.databases = clc.DBFilter
@@ -749,40 +751,6 @@ func (e *Exporter) writeSingleRecord(outputWriter io.Writer, seriesKey [][]byte,
 	if err != nil {
 		return nil, err
 	}
-	/*
-		for i, field := range rec.Schema {
-			if field.Name == "time" {
-				continue
-			}
-			buf = append(buf, EscapeFieldKey(field.Name)+"="...)
-			switch field.Type {
-			case influx.Field_Type_Float:
-				buf = strconv.AppendFloat(buf, rec.Column(i).FloatValues()[0], 'g', -1, 64)
-			case influx.Field_Type_Int:
-				buf = strconv.AppendInt(buf, rec.Column(i).IntegerValues()[0], 10)
-				buf = append(buf, 'i')
-			case influx.Field_Type_Boolean:
-				buf = strconv.AppendBool(buf, rec.Column(i).BooleanValues()[0])
-			case influx.Field_Type_String:
-				var str []string
-				str = rec.Column(i).StringValues(str)
-				buf = append(buf, '"')
-				buf = append(buf, EscapeStringFieldValue(str[0])...)
-				buf = append(buf, '"')
-			default:
-				// This shouldn't be possible, but we'll format it anyway.
-				buf = append(buf, fmt.Sprintf("%v", rec.Column(i))...)
-			}
-			if i != rec.Len()-2 {
-				buf = append(buf, ',')
-			} else {
-				buf = append(buf, ' ')
-			}
-		}
-		buf = strconv.AppendInt(buf, tm, 10)
-		buf = append(buf, '\n')
-
-	*/
 	if _, err := outputWriter.Write(buf); err != nil {
 		return buf, err
 	}
@@ -1119,7 +1087,7 @@ func (C *CsvParser) Parse2SeriesKeyWithoutVersion(key []byte, dst []byte, splitW
 		dst = append(dst, split[1])
 		src = src[valLen:]
 	}
-	return dst[:len(dst)], nil
+	return dst, nil
 
 }
 

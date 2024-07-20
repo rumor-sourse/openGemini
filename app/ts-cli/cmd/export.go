@@ -4,6 +4,8 @@ import (
 	"flag"
 	"github.com/openGemini/openGemini/app/ts-cli/geminicli"
 	"github.com/spf13/cobra"
+	"os"
+	"runtime/pprof"
 )
 
 func init() {
@@ -46,6 +48,10 @@ $ ts-cli export --format csv --out path/to/file --data /tmp/openGemini/data --ho
 			return err
 		}
 
+		cpuProfile, _ := os.Create("./docs/cpu_profile")
+		pprof.StartCPUProfile(cpuProfile)
+		defer pprof.StopCPUProfile()
+
 		if err := connectCLI(); err != nil {
 			return err
 		}
@@ -53,6 +59,9 @@ $ ts-cli export --format csv --out path/to/file --data /tmp/openGemini/data --ho
 		if err := exportCmd.Export(&options); err != nil {
 			return err
 		}
+
+		memProfile, _ := os.Create("./docs/mem_profile")
+		pprof.WriteHeapProfile(memProfile)
 		return nil
 	},
 }

@@ -1,6 +1,8 @@
 module github.com/openGemini/openGemini
 
-go 1.20
+go 1.21
+
+toolchain go1.21.12
 
 require (
 	github.com/BurntSushi/toml v0.4.1
@@ -132,6 +134,8 @@ require (
 	github.com/inconshreveable/mousetrap v1.0.0 // indirect
 	github.com/influxdata/flux v0.131.0 // indirect
 	github.com/influxdata/httprouter v1.3.1-0.20191122104820-ee83e2772f69 // indirect
+	github.com/influxdata/inch v0.0.0-20230124130601-4ae8d5121d6e // indirect
+	github.com/influxdata/influxdb1-client v0.0.0-20200827194710-b269163b24ab // indirect
 	github.com/influxdata/pkg-config v0.2.8 // indirect
 	github.com/influxdata/roaring v0.4.13-0.20180809181101-fc520f41fab6 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
