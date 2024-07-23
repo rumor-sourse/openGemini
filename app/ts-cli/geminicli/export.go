@@ -42,12 +42,13 @@ const (
 )
 
 type DataFilter struct {
+	databases    string
 	measurements map[string]struct{}
 	startTime    int64
 	endTime      int64
 }
 
-func NewDataFilter(mstFilter string) *DataFilter {
+func NewDataFilter(mstFilter string, dbFilter string) *DataFilter {
 	msts := strings.Split(mstFilter, ",")
 	mstNames := make(map[string]struct{})
 	for _, mst := range msts {
@@ -57,6 +58,7 @@ func NewDataFilter(mstFilter string) *DataFilter {
 		mstNames[mst] = struct{}{}
 	}
 	return &DataFilter{
+		databases:    dbFilter,
 		measurements: mstNames,
 		startTime:    0,
 		endTime:      0,
@@ -210,7 +212,6 @@ func (d *DatabaseDiskInfo) init(actualDataDir string, actualWalDir string, datab
 
 type Exporter struct {
 	exportFormat      string
-	databases         string
 	databaseDiskInfos []*DatabaseDiskInfo
 	actualDataPath    string
 	actualWalPath     string
@@ -276,7 +277,7 @@ func (e *Exporter) parseActualDir(clc *CommandLineConfig) error {
 // parseDatabaseInfos get all path infos for export.
 func (e *Exporter) parseDatabaseInfos() error {
 	// If the user does not specify a database, find all database and RP information
-	if e.databases == "" {
+	if e.filter.databases == "" {
 		if e.retentions != "" {
 			return fmt.Errorf("retention policies can only be specified when specifying a database separately")
 		}
@@ -298,7 +299,7 @@ func (e *Exporter) parseDatabaseInfos() error {
 		return nil
 	}
 
-	dbNames := strings.Split(e.databases, ",")
+	dbNames := strings.Split(e.filter.databases, ",")
 	// If the user specifies multiple databases, find info one by one
 	if len(dbNames) > 1 {
 		if e.retentions != "" {
@@ -346,12 +347,11 @@ func (e *Exporter) Init(clc *CommandLineConfig) error {
 	} else {
 		return fmt.Errorf("unsupported export format %q", e.exportFormat)
 	}
-	e.databases = clc.DBFilter
 	e.retentions = clc.Retentions
 	e.outPutPath = clc.Out
 	e.compress = clc.Compress
 	// filter dbs, msts, time
-	e.filter = NewDataFilter(clc.MeasurementFilter)
+	e.filter = NewDataFilter(clc.MeasurementFilter, clc.DBFilter)
 
 	// If output fd is stdout.
 	if e.usingStdOut() {
