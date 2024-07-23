@@ -698,7 +698,7 @@ func TestExporter_writeDML(t *testing.T) {
 	}
 }
 
-func TestLineFilter_Filter(t *testing.T) {
+func TestDataFilter_Filter(t *testing.T) {
 	type fields struct {
 		startTime int64
 		endTime   int64
@@ -746,11 +746,11 @@ func TestLineFilter_Filter(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			l := &LineFilter{
+			d := &DataFilter{
 				startTime: tt.fields.startTime,
 				endTime:   tt.fields.endTime,
 			}
-			assert.Equalf(t, tt.want, l.filter(tt.args.t), "Filter(%v)", tt.args.t)
+			assert.Equalf(t, tt.want, d.filter(tt.args.t), "Filter(%v)", tt.args.t)
 		})
 	}
 }

@@ -37,22 +37,33 @@ const (
 	csvFormatExporter = "csv"
 	txtFormatExporter = "txt"
 	dirNameSeparator  = "_"
+	stdOtuMark        = "-"
 	writerBufferSize  = 1024 * 1024
 )
 
-type LineFilter struct {
-	startTime int64
-	endTime   int64
+type DataFilter struct {
+	measurements map[string]struct{}
+	startTime    int64
+	endTime      int64
 }
 
-func NewLineFilter() *LineFilter {
-	return &LineFilter{
-		startTime: 0,
-		endTime:   0,
+func NewDataFilter(mstFilter string) *DataFilter {
+	msts := strings.Split(mstFilter, ",")
+	mstNames := make(map[string]struct{})
+	for _, mst := range msts {
+		if len(mst) == 0 {
+			continue
+		}
+		mstNames[mst] = struct{}{}
+	}
+	return &DataFilter{
+		measurements: mstNames,
+		startTime:    0,
+		endTime:      0,
 	}
 }
 
-func (l *LineFilter) parseTime(clc *CommandLineConfig) error {
+func (d *DataFilter) parseTime(clc *CommandLineConfig) error {
 	var start, end string
 	timeSlot := strings.Split(clc.TimeFilter, "~")
 	if len(timeSlot) == 2 {
@@ -65,9 +76,9 @@ func (l *LineFilter) parseTime(clc *CommandLineConfig) error {
 		if err != nil {
 			return err
 		}
-		l.startTime = s.UnixNano()
+		d.startTime = s.UnixNano()
 	} else {
-		l.startTime = math.MinInt64
+		d.startTime = math.MinInt64
 	}
 
 	if end != "" {
@@ -75,29 +86,29 @@ func (l *LineFilter) parseTime(clc *CommandLineConfig) error {
 		if err != nil {
 			return err
 		}
-		l.endTime = e.UnixNano()
+		d.endTime = e.UnixNano()
 	} else {
 		// set end time to max if it is not set.
-		l.endTime = math.MaxInt64
+		d.endTime = math.MaxInt64
 	}
 
-	if l.startTime > l.endTime {
+	if d.startTime > d.endTime {
 		return fmt.Errorf("start time `%q` > end time `%q`", start, end)
 	}
 
 	return nil
 }
 
-func (l *LineFilter) filter(t int64) bool {
-	return t >= l.startTime && t <= l.endTime
+func (d *DataFilter) filter(t int64) bool {
+	return t >= d.startTime && t <= d.endTime
 }
 
-func (l *LineFilter) isBelowMinFilter(t int64) bool {
-	return t < l.startTime
+func (d *DataFilter) isBelowMinFilter(t int64) bool {
+	return t < d.startTime
 }
 
-func (l *LineFilter) isAboveMaxFilter(t int64) bool {
-	return t > l.endTime
+func (d *DataFilter) isAboveMaxFilter(t int64) bool {
+	return t > d.endTime
 }
 
 type DatabaseDiskInfo struct {
@@ -197,8 +208,6 @@ func (d *DatabaseDiskInfo) init(actualDataDir string, actualWalDir string, datab
 	return nil
 }
 
-const stdOtuMark = "-"
-
 type Exporter struct {
 	exportFormat      string
 	databases         string
@@ -207,7 +216,7 @@ type Exporter struct {
 	actualWalPath     string
 	outPutPath        string
 	retentions        string
-	filter            *LineFilter
+	filter            *DataFilter
 	compress          bool
 	lineCount         uint64
 	Parser
@@ -334,14 +343,15 @@ func (e *Exporter) Init(clc *CommandLineConfig) error {
 		e.Parser = &CsvParser{}
 	} else if e.exportFormat == txtFormatExporter {
 		e.Parser = &TxtParser{}
+	} else {
+		return fmt.Errorf("unsupported export format %q", e.exportFormat)
 	}
 	e.databases = clc.DBFilter
 	e.retentions = clc.Retentions
 	e.outPutPath = clc.Out
-	// A filter to filter points by time.
-	// TODO(wtsclwq) Support filter measurement.
-	e.filter = NewLineFilter()
 	e.compress = clc.Compress
+	// filter dbs, msts, time
+	e.filter = NewDataFilter(clc.MeasurementFilter)
 
 	// If output fd is stdout.
 	if e.usingStdOut() {
@@ -477,6 +487,10 @@ func (e *Exporter) walkTsspFile(dbDiskInfo *DatabaseDiskInfo) error {
 			tsspPathSplits := strings.Split(path, string(byte(os.PathSeparator)))
 			measurementDirWithVersion := tsspPathSplits[len(tsspPathSplits)-2]
 			measurementName := influx.GetOriginMstName(measurementDirWithVersion)
+			_, ok := e.filter.measurements[measurementName]
+			if len(e.filter.measurements) != 0 && !ok {
+				return nil
+			}
 			// eg. "0:autogen" to ["0","autogen"]
 			splitPtWithRp := strings.Split(ptWithRp, ":")
 			key := dbDiskInfo.dbName + ":" + splitPtWithRp[1]
