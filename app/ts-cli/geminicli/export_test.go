@@ -445,33 +445,65 @@ func TestExporter_Export(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	exportPath := filepath.Join(t.TempDir(), "export.txt")
+	t.Run("test txt export", func(t *testing.T) {
+		exportPath := filepath.Join(t.TempDir(), "export.txt")
+		e := &Exporter{
+			stderrLogger:                    log.New(os.Stderr, "uint_test", log.LstdFlags),
+			stdoutLogger:                    log.New(os.Stdout, "uint_test", log.LstdFlags),
+			manifest:                        make(map[string]struct{}),
+			rpNameToMeasurementTsspFilesMap: make(map[string]map[string][]string),
+			rpNameToIdToIndexMap:            make(map[string]map[uint64]*tsi.MergeSetIndex),
+			rpNameToWalFilesMap:             make(map[string][]string),
+			Stderr:                          os.Stderr,
+			Stdout:                          os.Stdout,
+		}
+		clc := &CommandLineConfig{
+			Database:   "",
+			Export:     true,
+			DataDir:    dir,
+			WalDir:     dir,
+			Out:        exportPath,
+			Retentions: "",
+			Compress:   false,
+			Format:     txtFormatExporter,
+		}
+		err = e.Export(clc)
+		assert.NoError(t, err)
+		lpOnlyReader := strings.NewReader(lpOnlyTxtContent)
+		exportFile, err := os.Open(exportPath)
+		assert.NoError(t, err)
+		assert.NoError(t, compareStrings(t, lpOnlyReader, exportFile))
+	})
 
-	e := &Exporter{
-		stderrLogger:                    log.New(os.Stderr, "uint_test", log.LstdFlags),
-		stdoutLogger:                    log.New(os.Stdout, "uint_test", log.LstdFlags),
-		manifest:                        make(map[string]struct{}),
-		rpNameToMeasurementTsspFilesMap: make(map[string]map[string][]string),
-		rpNameToIdToIndexMap:            make(map[string]map[uint64]*tsi.MergeSetIndex),
-		rpNameToWalFilesMap:             make(map[string][]string),
-		Stderr:                          os.Stderr,
-		Stdout:                          os.Stdout,
-	}
-	clc := &CommandLineConfig{
-		Database:   "",
-		Export:     true,
-		DataDir:    dir,
-		WalDir:     dir,
-		Out:        exportPath,
-		Retentions: "",
-		Compress:   false,
-	}
-	err = e.Export(clc)
-	assert.NoError(t, err)
-	lpOnlyReader := strings.NewReader(lpOnlyContent)
-	exportFile, err := os.Open(exportPath)
-	assert.NoError(t, err)
-	assert.NoError(t, compareStrings(t, lpOnlyReader, exportFile))
+	t.Run("test csv export", func(t *testing.T) {
+		exportPath := filepath.Join(t.TempDir(), "export.txt")
+		e1 := &Exporter{
+			stderrLogger:                    log.New(os.Stderr, "uint_test", log.LstdFlags),
+			stdoutLogger:                    log.New(os.Stdout, "uint_test", log.LstdFlags),
+			manifest:                        make(map[string]struct{}),
+			rpNameToMeasurementTsspFilesMap: make(map[string]map[string][]string),
+			rpNameToIdToIndexMap:            make(map[string]map[uint64]*tsi.MergeSetIndex),
+			rpNameToWalFilesMap:             make(map[string][]string),
+			Stderr:                          os.Stderr,
+			Stdout:                          os.Stdout,
+		}
+		clc1 := &CommandLineConfig{
+			Database:   "",
+			Export:     true,
+			DataDir:    dir,
+			WalDir:     dir,
+			Out:        exportPath,
+			Retentions: "",
+			Compress:   false,
+			Format:     csvFormatExporter,
+		}
+		err = e1.Export(clc1)
+		assert.NoError(t, err)
+		lpOnlyReader := strings.NewReader(lpOnlyCsvContent)
+		exportFile, err := os.Open(exportPath)
+		assert.NoError(t, err)
+		assert.NoError(t, compareStrings(t, lpOnlyReader, exportFile))
+	})
 }
 
 func TestEscapeFieldKey(t *testing.T) {
@@ -698,7 +730,7 @@ func TestExporter_writeDML(t *testing.T) {
 	}
 }
 
-func TestDataFilter_Filter(t *testing.T) {
+func TestDataFilter_timeFilter(t *testing.T) {
 	type fields struct {
 		startTime int64
 		endTime   int64
@@ -750,13 +782,51 @@ func TestDataFilter_Filter(t *testing.T) {
 				startTime: tt.fields.startTime,
 				endTime:   tt.fields.endTime,
 			}
-			assert.Equalf(t, tt.want, d.filter(tt.args.t), "Filter(%v)", tt.args.t)
+			assert.Equalf(t, tt.want, d.timeFilter(tt.args.t), "Filter(%v)", tt.args.t)
 		})
 	}
 }
 
-var lpOnlyContent = `# CONTEXT-DATABASE: db0
-# CONTEXT-MEASUREMENT: cpu 
+func TestDataFilter_parseMeasurements(t *testing.T) {
+	tests := []struct {
+		name string
+		args string
+		want map[string]map[string]struct{}
+	}{
+		{
+			name: "T1",
+			args: "db1:mst1,mst2;db2:mst3;db3:mst4,mst5,mst6",
+			want: map[string]map[string]struct{}{
+				"db1": {"mst1": {}, "mst2": {}},
+				"db2": {"mst3": {}},
+				"db3": {"mst4": {}, "mst5": {}, "mst6": {}},
+			},
+		},
+		{
+			name: "T2",
+			args: "db1:mst1,mst2",
+			want: map[string]map[string]struct{}{
+				"db1": {"mst1": {}, "mst2": {}},
+			},
+		},
+		{
+			name: "T3",
+			args: "",
+			want: map[string]map[string]struct{}{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := NewDataFilter()
+			err := d.parseMeasurements(tt.args)
+			assert.NoError(t, err)
+			assert.EqualValues(t, tt.want, d.measurements)
+		})
+	}
+}
+
+var lpOnlyTxtContent = `# CONTEXT-DATABASE: db0
+# CONTEXT-MEASUREMENT: cpu
 # CONTEXT-RETENTION-POLICY: rp0
 # DDL
 # DML
@@ -804,4 +874,57 @@ cpu,tag\ ke\,y\=2=tagvalue2_8,tagkey1=tagvalue1_8,tagkey3=tagvalue3_8,tagkey4=ta
 cpu,tag\ ke\,y\=2=tagvalue2_8,tagkey1=tagvalue1_8,tagkey3=tagvalue3_8,tagkey4=ta\ valu\,e\=4_8 fie\ ld4_\,fl\=oat=12.799999999999999,field1_string="test-test-test-test-7-4",field2_int=12i,field3_bool=false 1685278966062614208
 cpu,tag\ ke\,y\=2=tagvalue2_8,tagkey1=tagvalue1_8,tagkey3=tagvalue3_8,tagkey4=ta\ valu\,e\=4_8 fie\ ld4_\,fl\=oat=8.799999999999999,field1_string="test-test-test-test-7",field2_int=8i,field3_bool=false 1685278962062614208
 cpu,tag\ ke\,y\=2=tagvalue2_8,tagkey1=tagvalue1_8,tagkey3=tagvalue3_8,tagkey4=ta\ valu\,e\=4_8 fie\ ld4_\,fl\=oat=9.799999999999999,field1_string="test-test-test-test-7-1",field2_int=9i,field3_bool=true 1685278963062614208
+`
+
+var lpOnlyCsvContent = `# CONTEXT-DATABASE: db0
+# CONTEXT-MEASUREMENT: cpu
+# CONTEXT-RETENTION-POLICY: rp0
+# DDL
+# DML
+# FROM TSSP FILE.
+# openGemini EXPORT: 1677-09-21T00:12:43Z - 2262-04-11T23:47:16Z
+CREATE DATABASE db0
+CREATE RETENTION POLICY rp0 ON db0 DURATION 0s REPLICATION 1
+# CONTEXT-TAGS: tag\ ke\,y\=2;tagkey1;tagkey3;tagkey4 
+tag\ ke\,y\=2,tagkey1,tagkey3,tagkey4,fie ld4_,fl=oat,field1_string,field2_int,field3_bool,time
+tagvalue2_1,tagvalue1_1,tagvalue3_1,ta\ valu\,e\=4_1,1.1,,1i,,1685292814231278675
+tagvalue2_1,tagvalue1_1,tagvalue3_1,ta\ valu\,e\=4_1,2.1,,2i,,1685292815231278675
+tagvalue2_1,tagvalue1_1,tagvalue3_1,ta\ valu\,e\=4_1,3.1,,3i,,1685292816231278675
+tagvalue2_1,tagvalue1_1,tagvalue3_1,ta\ valu\,e\=4_1,4.1,,4i,,1685292817231278675
+tagvalue2_1,tagvalue1_1,tagvalue3_1,ta\ valu\,e\=4_1,5.1,,5i,,1685292818231278675
+tagvalue2_2,tagvalue1_2,tagvalue3_2,ta\ valu\,e\=4_2,2.2,"test-test-test-test-1",2i,false,1685306996543856411
+tagvalue2_2,tagvalue1_2,tagvalue3_2,ta\ valu\,e\=4_2,3.2,"test-test-test-test-1-1",3i,true,1685306997543856411
+tagvalue2_2,tagvalue1_2,tagvalue3_2,ta\ valu\,e\=4_2,4.2,"test-test-test-test-1-2",4i,false,1685306998543856411
+tagvalue2_2,tagvalue1_2,tagvalue3_2,ta\ valu\,e\=4_2,5.2,"test-test-test-test-1-3",5i,true,1685306999543856411
+tagvalue2_2,tagvalue1_2,tagvalue3_2,ta\ valu\,e\=4_2,6.2,"test-test-test-test-1-4",6i,false,1685307000543856411
+tagvalue2_3,tagvalue1_3,tagvalue3_3,ta\ valu\,e\=4_3,3.3000000000000003,"test-test-test-test-2",3i,true,1685266998101878760
+tagvalue2_3,tagvalue1_3,tagvalue3_3,ta\ valu\,e\=4_3,4.300000000000001,"test-test-test-test-2-1",4i,true,1685266999101878760
+tagvalue2_3,tagvalue1_3,tagvalue3_3,ta\ valu\,e\=4_3,5.300000000000001,"test-test-test-test-2-2",5i,false,1685267000101878760
+tagvalue2_3,tagvalue1_3,tagvalue3_3,ta\ valu\,e\=4_3,6.300000000000001,"test-test-test-test-2-3",6i,true,1685267001101878760
+tagvalue2_3,tagvalue1_3,tagvalue3_3,ta\ valu\,e\=4_3,7.300000000000001,"test-test-test-test-2-4",7i,false,1685267002101878760
+tagvalue2_4,tagvalue1_4,tagvalue3_4,ta\ valu\,e\=4_4,4.4,"test-test-test-test-3",4i,false,1685318046526624009
+tagvalue2_4,tagvalue1_4,tagvalue3_4,ta\ valu\,e\=4_4,5.4,"test-test-test-test-3-1",5i,true,1685318047526624009
+tagvalue2_4,tagvalue1_4,tagvalue3_4,ta\ valu\,e\=4_4,6.4,"test-test-test-test-3-2",6i,false,1685318048526624009
+tagvalue2_4,tagvalue1_4,tagvalue3_4,ta\ valu\,e\=4_4,7.4,"test-test-test-test-3-3",7i,true,1685318049526624009
+tagvalue2_4,tagvalue1_4,tagvalue3_4,ta\ valu\,e\=4_4,8.4,"test-test-test-test-3-4",8i,false,1685318050526624009
+tagvalue2_5,tagvalue1_5,tagvalue3_5,ta\ valu\,e\=4_5,5.5,"test-test-test-test-4",5i,true,1685309005743547657
+tagvalue2_5,tagvalue1_5,tagvalue3_5,ta\ valu\,e\=4_5,6.5,"test-test-test-test-4-1",6i,true,1685309006743547657
+tagvalue2_5,tagvalue1_5,tagvalue3_5,ta\ valu\,e\=4_5,7.5,"test-test-test-test-4-2",7i,false,1685309007743547657
+tagvalue2_5,tagvalue1_5,tagvalue3_5,ta\ valu\,e\=4_5,8.5,"test-test-test-test-4-3",8i,true,1685309008743547657
+tagvalue2_5,tagvalue1_5,tagvalue3_5,ta\ valu\,e\=4_5,9.5,"test-test-test-test-4-4",9i,false,1685309009743547657
+tagvalue2_6,tagvalue1_6,tagvalue3_6,ta\ valu\,e\=4_6,10.6,"test-test-test-test-5-4",10i,false,1685303831214237261
+tagvalue2_6,tagvalue1_6,tagvalue3_6,ta\ valu\,e\=4_6,6.6,"test-test-test-test-5",6i,false,1685303827214237261
+tagvalue2_6,tagvalue1_6,tagvalue3_6,ta\ valu\,e\=4_6,7.6,"test-test-test-test-5-1",7i,true,1685303828214237261
+tagvalue2_6,tagvalue1_6,tagvalue3_6,ta\ valu\,e\=4_6,8.6,"test-test-test-test-5-2",8i,false,1685303829214237261
+tagvalue2_6,tagvalue1_6,tagvalue3_6,ta\ valu\,e\=4_6,9.6,"test-test-test-test-5-3",9i,true,1685303830214237261
+tagvalue2_7,tagvalue1_7,tagvalue3_7,ta\ valu\,e\=4_7,10.7,"test-test-test-test-6-3",10i,true,1685269707883513247
+tagvalue2_7,tagvalue1_7,tagvalue3_7,ta\ valu\,e\=4_7,11.7,"test-test-test-test-6-4",11i,false,1685269708883513247
+tagvalue2_7,tagvalue1_7,tagvalue3_7,ta\ valu\,e\=4_7,7.699999999999999,"test-test-test-test-6",7i,true,1685269704883513247
+tagvalue2_7,tagvalue1_7,tagvalue3_7,ta\ valu\,e\=4_7,8.7,"test-test-test-test-6-1",8i,true,1685269705883513247
+tagvalue2_7,tagvalue1_7,tagvalue3_7,ta\ valu\,e\=4_7,9.7,"test-test-test-test-6-2",9i,false,1685269706883513247
+tagvalue2_8,tagvalue1_8,tagvalue3_8,ta\ valu\,e\=4_8,10.799999999999999,"test-test-test-test-7-2",10i,false,1685278964062614208
+tagvalue2_8,tagvalue1_8,tagvalue3_8,ta\ valu\,e\=4_8,11.799999999999999,"test-test-test-test-7-3",11i,true,1685278965062614208
+tagvalue2_8,tagvalue1_8,tagvalue3_8,ta\ valu\,e\=4_8,12.799999999999999,"test-test-test-test-7-4",12i,false,1685278966062614208
+tagvalue2_8,tagvalue1_8,tagvalue3_8,ta\ valu\,e\=4_8,8.799999999999999,"test-test-test-test-7",8i,false,1685278962062614208
+tagvalue2_8,tagvalue1_8,tagvalue3_8,ta\ valu\,e\=4_8,9.799999999999999,"test-test-test-test-7-1",9i,true,1685278963062614208
 `

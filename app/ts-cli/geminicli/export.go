@@ -19,6 +19,8 @@ import (
 	"github.com/openGemini/openGemini/lib/record"
 	"github.com/openGemini/openGemini/lib/util"
 	"github.com/openGemini/openGemini/lib/util/lifted/vm/protoparser/influx"
+	"github.com/vbauerster/mpb/v7"
+	"github.com/vbauerster/mpb/v7/decor"
 	"io"
 	"io/fs"
 	"log"
@@ -41,25 +43,21 @@ const (
 	writerBufferSize  = 1024 * 1024
 )
 
+var (
+	progress = mpb.New(mpb.WithWidth(100))
+)
+
 type DataFilter struct {
-	databases    string
-	measurements map[string]struct{}
+	databases    []string
+	measurements map[string]map[string]struct{}
 	startTime    int64
 	endTime      int64
 }
 
-func NewDataFilter(mstFilter string, dbFilter string) *DataFilter {
-	msts := strings.Split(mstFilter, ",")
-	mstNames := make(map[string]struct{})
-	for _, mst := range msts {
-		if len(mst) == 0 {
-			continue
-		}
-		mstNames[mst] = struct{}{}
-	}
+func NewDataFilter() *DataFilter {
 	return &DataFilter{
-		databases:    dbFilter,
-		measurements: mstNames,
+		databases:    nil,
+		measurements: make(map[string]map[string]struct{}),
 		startTime:    0,
 		endTime:      0,
 	}
@@ -101,15 +99,53 @@ func (d *DataFilter) parseTime(clc *CommandLineConfig) error {
 	return nil
 }
 
-func (d *DataFilter) filter(t int64) bool {
+func (d *DataFilter) parseDatabases(dbFilter string) {
+	if dbFilter == "" {
+		return
+	}
+	d.databases = strings.Split(dbFilter, ",")
+}
+
+func (d *DataFilter) parseMeasurements(mstFilter string) error {
+	if mstFilter == "" {
+		return nil
+	}
+	// db1:mst1,mst2;db2:mst3
+	dbsMsts := strings.Split(mstFilter, ";")
+	for _, dbMsts := range dbsMsts {
+		// db1:mst1,mst2
+		dbWithMsts := strings.Split(dbMsts, ":")
+		if len(dbWithMsts) != 2 {
+			return fmt.Errorf("invalid measurement filter : %q", mstFilter)
+		}
+		// db1
+		db := dbWithMsts[0]
+		if d.databases != nil && checkStringNotInSlice(d.databases, db) {
+			return fmt.Errorf("database %q not in dbfilter %q", db, d.databases)
+		}
+		// mst1,mst2
+		msts := strings.Split(dbWithMsts[1], ",")
+		mstNames := make(map[string]struct{})
+		for _, mst := range msts {
+			if len(mst) == 0 {
+				continue
+			}
+			mstNames[mst] = struct{}{}
+		}
+		d.measurements[db] = mstNames
+	}
+	return nil
+}
+
+func (d *DataFilter) timeFilter(t int64) bool {
 	return t >= d.startTime && t <= d.endTime
 }
 
-func (d *DataFilter) isBelowMinFilter(t int64) bool {
+func (d *DataFilter) isBelowMinTimeFilter(t int64) bool {
 	return t < d.startTime
 }
 
-func (d *DataFilter) isAboveMaxFilter(t int64) bool {
+func (d *DataFilter) isAboveMaxTimeFilter(t int64) bool {
 	return t > d.endTime
 }
 
@@ -213,6 +249,7 @@ func (d *DatabaseDiskInfo) init(actualDataDir string, actualWalDir string, datab
 type Exporter struct {
 	exportFormat      string
 	databaseDiskInfos []*DatabaseDiskInfo
+	dataTotalCount    int
 	actualDataPath    string
 	actualWalPath     string
 	outPutPath        string
@@ -233,6 +270,7 @@ type Exporter struct {
 
 	Stderr io.Writer
 	Stdout io.Writer
+	bar    *mpb.Bar
 }
 
 func NewExporter() *Exporter {
@@ -247,6 +285,9 @@ func NewExporter() *Exporter {
 
 		Stdout: os.Stdout,
 		Stderr: os.Stderr,
+
+		dataTotalCount: 0,
+		bar:            nil,
 	}
 }
 
@@ -277,7 +318,7 @@ func (e *Exporter) parseActualDir(clc *CommandLineConfig) error {
 // parseDatabaseInfos get all path infos for export.
 func (e *Exporter) parseDatabaseInfos() error {
 	// If the user does not specify a database, find all database and RP information
-	if e.filter.databases == "" {
+	if e.filter.databases == nil {
 		if e.retentions != "" {
 			return fmt.Errorf("retention policies can only be specified when specifying a database separately")
 		}
@@ -299,7 +340,7 @@ func (e *Exporter) parseDatabaseInfos() error {
 		return nil
 	}
 
-	dbNames := strings.Split(e.filter.databases, ",")
+	dbNames := e.filter.databases
 	// If the user specifies multiple databases, find info one by one
 	if len(dbNames) > 1 {
 		if e.retentions != "" {
@@ -341,9 +382,9 @@ func (e *Exporter) parseDatabaseInfos() error {
 func (e *Exporter) Init(clc *CommandLineConfig) error {
 	e.exportFormat = clc.Format
 	if e.exportFormat == csvFormatExporter {
-		e.Parser = &CsvParser{}
+		e.Parser = NewCsvParser()
 	} else if e.exportFormat == txtFormatExporter {
-		e.Parser = &TxtParser{}
+		e.Parser = NewTxtParser()
 	} else {
 		return fmt.Errorf("unsupported export format %q", e.exportFormat)
 	}
@@ -351,7 +392,7 @@ func (e *Exporter) Init(clc *CommandLineConfig) error {
 	e.outPutPath = clc.Out
 	e.compress = clc.Compress
 	// filter dbs, msts, time
-	e.filter = NewDataFilter(clc.MeasurementFilter, clc.DBFilter)
+	e.filter = NewDataFilter()
 
 	// If output fd is stdout.
 	if e.usingStdOut() {
@@ -360,10 +401,15 @@ func (e *Exporter) Init(clc *CommandLineConfig) error {
 		e.defaultLogger = e.stdoutLogger
 	}
 
+	e.filter.parseDatabases(clc.DBFilter)
+
 	if err := e.filter.parseTime(clc); err != nil {
 		return err
 	}
 
+	if err := e.filter.parseMeasurements(clc.MeasurementFilter); err != nil {
+		return err
+	}
 	// ie. dataDir=/tmp/openGemini/data               walDir=/tmp/openGemini/data
 	//     actualDataPath=/tmp/openGemini/data/data    actualWalPath=/tmp/openGemini/data/wal
 	if err := e.parseActualDir(clc); err != nil {
@@ -390,6 +436,7 @@ func (e *Exporter) Export(clc *CommandLineConfig) error {
 			return err
 		}
 	}
+	// e.bar = e.NewBar(e.dataTotalCount)
 	return e.write()
 }
 
@@ -414,6 +461,24 @@ func (e *Exporter) walkDatabase(dbDiskInfo *DatabaseDiskInfo) error {
 		}
 	}
 	return nil
+}
+
+func (e *Exporter) NewBar(total int) *mpb.Bar {
+	bar := progress.New(int64(total),
+		mpb.BarStyle().Lbound("[").Filler("=").Tip(">").Padding("-").Rbound("]"),
+		mpb.PrependDecorators(
+			decor.Name("Exporting Data:", decor.WC{W: 20, C: decor.DidentRight}),
+			decor.CountersNoUnit("%d/%d", decor.WC{W: 15, C: decor.DidentRight}),
+			decor.OnComplete(
+				decor.AverageETA(decor.ET_STYLE_GO, decor.WC{W: 6}),
+				"done",
+			),
+		),
+		mpb.AppendDecorators(
+			decor.Percentage(),
+		),
+	)
+	return bar
 }
 
 // write writes data to output fd user specifics.
@@ -483,14 +548,15 @@ func (e *Exporter) walkTsspFile(dbDiskInfo *DatabaseDiskInfo) error {
 			if filepath.Ext(path) != "."+tsspFileExtension {
 				return nil
 			}
-			//search .tssp file
+			// search .tssp file
 			tsspPathSplits := strings.Split(path, string(byte(os.PathSeparator)))
 			measurementDirWithVersion := tsspPathSplits[len(tsspPathSplits)-2]
 			measurementName := influx.GetOriginMstName(measurementDirWithVersion)
-			_, ok := e.filter.measurements[measurementName]
-			if len(e.filter.measurements) != 0 && !ok {
+			_, ok := e.filter.measurements[dbDiskInfo.dbName][measurementName]
+			if len(e.filter.measurements[dbDiskInfo.dbName]) != 0 && !ok {
 				return nil
 			}
+			e.updateDataTotalCount(path)
 			// eg. "0:autogen" to ["0","autogen"]
 			splitPtWithRp := strings.Split(ptWithRp, ":")
 			key := dbDiskInfo.dbName + ":" + splitPtWithRp[1]
@@ -507,6 +573,32 @@ func (e *Exporter) walkTsspFile(dbDiskInfo *DatabaseDiskInfo) error {
 	return nil
 }
 
+func (e *Exporter) updateDataTotalCount(path string) {
+	lockPath := ""
+	f, err := immutable.OpenTSSPFile(path, &lockPath, true, false)
+	if err != nil {
+		panic(err)
+	}
+	defer util.MustClose(f)
+	fi := immutable.NewFileIterator(f, immutable.CLog)
+	itr := immutable.NewChunkIterator(fi)
+	for {
+		if !itr.Next() {
+			break
+		}
+		rec := itr.GetRecord()
+		var recs []record.Record
+		recs = rec.Split(recs, 1)
+		for _, r := range recs {
+			tm := r.Times()[0]
+			if !e.filter.timeFilter(tm) {
+				continue
+			}
+			e.dataTotalCount++
+		}
+	}
+}
+
 func (e *Exporter) walkWalFile(dbDiskInfo *DatabaseDiskInfo) error {
 	for ptWithRp := range dbDiskInfo.rps {
 		rpDir := dbDiskInfo.rpToWalDirMap[ptWithRp]
@@ -517,7 +609,7 @@ func (e *Exporter) walkWalFile(dbDiskInfo *DatabaseDiskInfo) error {
 			if filepath.Ext(path) != "."+walFileExtension {
 				return nil
 			}
-			//eg. "0:autogen" to ["0","autogen"]
+			// eg. "0:autogen" to ["0","autogen"]
 			splitPtWithRp := strings.Split(ptWithRp, ":")
 			key := dbDiskInfo.dbName + ":" + splitPtWithRp[1]
 			e.manifest[key] = struct{}{}
@@ -610,6 +702,7 @@ func (e *Exporter) writeDML(metaWriter io.Writer, outputWriter io.Writer) error 
 			if err := e.writeAllTsspFilesInRp(metaWriter, outputWriter, measurementToTsspFileMap, shardKeyToIndexMap); err != nil {
 				return err
 			}
+			// progress.Wait()
 			e.defaultLogger.Println("complete.")
 		}
 
@@ -631,7 +724,7 @@ func (e *Exporter) writeAllTsspFilesInRp(metaWriter io.Writer, outputWriter io.W
 	var isOrder bool
 	hasWrittenMstInfo := make(map[string]bool)
 	for measurementName, files := range measurementFilesMap {
-		fmt.Fprintf(metaWriter, "# CONTEXT-MEASUREMENT: %s \n", measurementName)
+		fmt.Fprintf(metaWriter, "# CONTEXT-MEASUREMENT: %s\n", measurementName)
 		hasWrittenMstInfo[measurementName] = false
 		for _, file := range files {
 			splits := strings.Split(file, string(os.PathSeparator))
@@ -650,7 +743,7 @@ func (e *Exporter) writeAllTsspFilesInRp(metaWriter io.Writer, outputWriter io.W
 				return err
 			}
 			if !hasWrittenMstInfo[measurementName] {
-				if err := e.Parser.WriteMstInfo(metaWriter, outputWriter, file, isOrder, indexesMap[indexId]); err != nil {
+				if err := e.Parser.WriteMstInfoFromTssp(metaWriter, outputWriter, file, isOrder, indexesMap[indexId]); err != nil {
 					return err
 				}
 				hasWrittenMstInfo[measurementName] = true
@@ -675,7 +768,6 @@ func (e *Exporter) writeSingleTsspFile(filePath string, outputWriter io.Writer, 
 	}
 	fi := immutable.NewFileIterator(tsspFile, immutable.CLog)
 	itr := immutable.NewChunkIterator(fi)
-
 	var maxTime int64
 	var minTime int64
 	for {
@@ -693,7 +785,7 @@ func (e *Exporter) writeSingleTsspFile(filePath string, outputWriter io.Writer, 
 		minTime = rec.MinTime(true)
 
 		// Check if the maximum and minimum time of records that the SID points to are in the filter range of e.filter
-		if e.filter.isBelowMinFilter(maxTime) || e.filter.isAboveMaxFilter(minTime) {
+		if e.filter.isBelowMinTimeFilter(maxTime) || e.filter.isAboveMaxTimeFilter(minTime) {
 			continue
 		}
 
@@ -756,11 +848,10 @@ func (e *Exporter) writeSeriesRecords(outputWriter io.Writer, sid uint64, rec *r
 // writeSingleRecord parses a record and a series key to line protocol, and writes it.
 func (e *Exporter) writeSingleRecord(outputWriter io.Writer, seriesKey [][]byte, rec record.Record, buf []byte) ([]byte, error) {
 	tm := rec.Times()[0]
-	if !e.filter.filter(tm) {
+	if !e.filter.timeFilter(tm) {
 		return buf, nil
 	}
 	buf = bytes.Join(seriesKey, []byte(","))
-	buf = append(buf, ' ')
 	buf, err := e.Parser.AppendFields(rec, buf)
 	if err != nil {
 		return nil, err
@@ -769,6 +860,7 @@ func (e *Exporter) writeSingleRecord(outputWriter io.Writer, seriesKey [][]byte,
 		return buf, err
 	}
 	e.lineCount++
+	// e.bar.Increment()
 	buf = buf[:0]
 	return buf, nil
 }
@@ -893,7 +985,7 @@ func (e *Exporter) writeSingleRow(row influx.Row, outputWriter io.Writer, buf []
 	fields := row.Fields
 	tm := row.Timestamp
 
-	if !e.filter.filter(tm) {
+	if !e.filter.timeFilter(tm) {
 		return buf, nil
 	}
 
@@ -945,11 +1037,14 @@ func (e *Exporter) writeSingleRow(row influx.Row, outputWriter io.Writer, buf []
 type Parser interface {
 	Parse2SeriesKeyWithoutVersion(key []byte, dst []byte, splitWithNull bool) ([]byte, error)
 	AppendFields(rec record.Record, buf []byte) ([]byte, error)
-	WriteMstInfo(metaWriter io.Writer, outputWriter io.Writer, filePath string, isOrder bool, index *tsi.MergeSetIndex) error
+	WriteMstInfoFromTssp(metaWriter io.Writer, outputWriter io.Writer, filePath string, isOrder bool, index *tsi.MergeSetIndex) error
 }
 
 type TxtParser struct{}
-type CsvParser struct{}
+
+func NewTxtParser() *TxtParser {
+	return &TxtParser{}
+}
 
 // Parse2SeriesKeyWithoutVersion parse encoded index key to line protocol series key,without version and escape special characters
 // encoded index key format: [total len][ms len][ms][tagkey1 len][tagkey1 val]...]
@@ -992,6 +1087,7 @@ func (T *TxtParser) Parse2SeriesKeyWithoutVersion(key []byte, dst []byte, splitW
 }
 
 func (T *TxtParser) AppendFields(rec record.Record, buf []byte) ([]byte, error) {
+	buf = append(buf, ' ')
 	for i, field := range rec.Schema {
 		if field.Name == "time" {
 			continue
@@ -1026,47 +1122,22 @@ func (T *TxtParser) AppendFields(rec record.Record, buf []byte) ([]byte, error) 
 	return buf, nil
 }
 
-func (T *TxtParser) WriteMstInfo(metaWriter io.Writer, _ io.Writer, filePath string, isOrder bool, index *tsi.MergeSetIndex) error {
-	lockPath := ""
-	tsspFile, err := immutable.OpenTSSPFile(filePath, &lockPath, isOrder, false)
-	defer util.MustClose(tsspFile)
-	if err != nil {
-		return err
-	}
-	fi := immutable.NewFileIterator(tsspFile, immutable.CLog)
-	itr := immutable.NewChunkIterator(fi)
-	itr.Next()
-	sid := itr.GetSeriesID()
-	if sid == 0 {
-		return fmt.Errorf("series ID is zero")
-	}
-	rec := itr.GetRecord()
-	record.CheckRecord(rec)
-	var combineKey []byte
-	var seriesKeys [][]byte
-	var isExpectSeries []bool
-	// Use sid get series key's []byte
-	if seriesKeys, _, isExpectSeries, err = index.SearchSeriesWithTagArray(sid, seriesKeys, nil, combineKey, isExpectSeries, nil); err != nil {
-		return err
-	}
-	_, src, err := influx.MeasurementName(seriesKeys[0])
-	tagsN := encoding.UnmarshalUint16(src)
-	src = src[2:]
-	var i uint16
-	var tags []string
-	for i = 0; i < tagsN; i++ {
-		keyLen := encoding.UnmarshalUint16(src)
-		src = src[2:]
-		tagKey := EscapeTagKey(string(src[:keyLen]))
-		tags = append(tags, tagKey)
-		src = src[keyLen:]
-
-		valLen := encoding.UnmarshalUint16(src)
-		src = src[2:]
-		src = src[valLen:]
-	}
-	fmt.Fprintf(metaWriter, "# CONTEXT-TAGS: %s \n", strings.Join(tags, ","))
+func (T *TxtParser) WriteMstInfoFromTssp(_ io.Writer, _ io.Writer, _ string, _ bool, _ *tsi.MergeSetIndex) error {
 	return nil
+}
+
+type CsvParser struct {
+	fieldsName     map[string]map[string][]string // database -> measurement -> []field
+	curDatabase    string
+	curMeasurement string
+}
+
+func NewCsvParser() *CsvParser {
+	return &CsvParser{
+		make(map[string]map[string][]string),
+		"",
+		"",
+	}
 }
 
 // Parse2SeriesKeyWithoutVersion parse encoded index key to csv series key,without version and escape special characters
@@ -1106,51 +1177,62 @@ func (C *CsvParser) Parse2SeriesKeyWithoutVersion(key []byte, dst []byte, splitW
 }
 
 func (C *CsvParser) AppendFields(rec record.Record, buf []byte) ([]byte, error) {
-	for i, field := range rec.Schema {
-		if field.Name == "time" {
+	curFieldsName := C.fieldsName[C.curDatabase][C.curMeasurement]
+	for _, fieldName := range curFieldsName {
+		if fieldName == "time" {
 			continue
 		}
-		switch field.Type {
-		case influx.Field_Type_Float:
-			buf = strconv.AppendFloat(buf, rec.Column(i).FloatValues()[0], 'g', -1, 64)
-		case influx.Field_Type_Int:
-			buf = strconv.AppendInt(buf, rec.Column(i).IntegerValues()[0], 10)
-			buf = append(buf, 'i')
-		case influx.Field_Type_Boolean:
-			buf = strconv.AppendBool(buf, rec.Column(i).BooleanValues()[0])
-		case influx.Field_Type_String:
-			var str []string
-			str = rec.Column(i).StringValues(str)
-			buf = append(buf, '"')
-			buf = append(buf, EscapeStringFieldValue(str[0])...)
-			buf = append(buf, '"')
-		default:
-			// This shouldn't be possible, but we'll format it anyway.
-			buf = append(buf, fmt.Sprintf("%v", rec.Column(i))...)
+		k, ok := getFieldNameIndex(rec.Schema, fieldName)
+		if !ok {
+			buf = append(buf, ',')
+		} else {
+			switch rec.Schema[k].Type {
+			case influx.Field_Type_Float:
+				buf = strconv.AppendFloat(buf, rec.Column(k).FloatValues()[0], 'g', -1, 64)
+			case influx.Field_Type_Int:
+				buf = strconv.AppendInt(buf, rec.Column(k).IntegerValues()[0], 10)
+				buf = append(buf, 'i')
+			case influx.Field_Type_Boolean:
+				buf = strconv.AppendBool(buf, rec.Column(k).BooleanValues()[0])
+			case influx.Field_Type_String:
+				var str []string
+				str = rec.Column(k).StringValues(str)
+				buf = append(buf, '"')
+				buf = append(buf, EscapeStringFieldValue(str[0])...)
+				buf = append(buf, '"')
+			default:
+				// This shouldn't be possible, but we'll format it anyway.
+				buf = append(buf, fmt.Sprintf("%v", rec.Column(k))...)
+			}
+			if k != rec.Len()-1 {
+				buf = append(buf, ',')
+			}
 		}
-		buf = append(buf, ',')
 	}
 	buf = strconv.AppendInt(buf, rec.Times()[0], 10)
 	buf = append(buf, '\n')
 	return buf, nil
 }
 
-func (C *CsvParser) WriteMstInfo(metaWriter io.Writer, outputWriter io.Writer, filePath string, isOrder bool, index *tsi.MergeSetIndex) error {
+func (C *CsvParser) WriteMstInfoFromTssp(metaWriter io.Writer, outputWriter io.Writer, filePath string, isOrder bool, index *tsi.MergeSetIndex) error {
+	tsspPathSplits := strings.Split(filePath, string(byte(os.PathSeparator)))
+	measurementDirWithVersion := tsspPathSplits[len(tsspPathSplits)-2]
+	measurementName := influx.GetOriginMstName(measurementDirWithVersion)
+	dbName := tsspPathSplits[len(tsspPathSplits)-7]
 	lockPath := ""
 	tsspFile, err := immutable.OpenTSSPFile(filePath, &lockPath, isOrder, false)
 	defer util.MustClose(tsspFile)
 	if err != nil {
 		return err
 	}
-	fi := immutable.NewFileIterator(tsspFile, immutable.CLog)
-	itr := immutable.NewChunkIterator(fi)
-	itr.Next()
-	sid := itr.GetSeriesID()
+	// search tags
+	fiTag := immutable.NewFileIterator(tsspFile, immutable.CLog)
+	itrTag := immutable.NewChunkIterator(fiTag)
+	itrTag.Next()
+	sid := itrTag.GetSeriesID()
 	if sid == 0 {
 		return fmt.Errorf("series ID is zero")
 	}
-	rec := itr.GetRecord()
-	record.CheckRecord(rec)
 	var combineKey []byte
 	var seriesKeys [][]byte
 	var isExpectSeries []bool
@@ -1174,10 +1256,18 @@ func (C *CsvParser) WriteMstInfo(metaWriter io.Writer, outputWriter io.Writer, f
 		src = src[2:]
 		src = src[valLen:]
 	}
-	for _, field := range rec.Schema {
-		fields = append(fields, field.Name)
-	}
 	fmt.Fprintf(metaWriter, "# CONTEXT-TAGS: %s \n", strings.Join(tags, ";"))
+	// search fields
+	fiField := immutable.NewFileIterator(tsspFile, immutable.CLog)
+	itrField := immutable.NewChunkIterator(fiField)
+	itrField.NextChunkMeta()
+	for _, colMeta := range fiField.GetCurtChunkMeta().GetColMeta() {
+		fields = append(fields, colMeta.Name())
+	}
+	C.fieldsName[dbName] = make(map[string][]string)
+	C.fieldsName[dbName][measurementName] = fields
+	C.curDatabase = dbName
+	C.curMeasurement = measurementName
 	buf := influx.GetBytesBuffer()
 	buf = append(buf, strings.Join(tags, ",")...)
 	buf = append(buf, ',')
@@ -1253,4 +1343,23 @@ func EscapeTagValue(in string) string {
 // with escaped values.
 func EscapeMstName(in string) string {
 	return escapeMstNameReplacer.Replace(in)
+}
+
+func checkStringNotInSlice(slice []string, str string) bool {
+	elementMap := make(map[string]bool)
+	for _, v := range slice {
+		elementMap[v] = true
+	}
+
+	_, exists := elementMap[str]
+	return !exists
+}
+
+func getFieldNameIndex(slice []record.Field, str string) (int, bool) {
+	for i, v := range slice {
+		if v.Name == str {
+			return i, true
+		}
+	}
+	return 0, false
 }
