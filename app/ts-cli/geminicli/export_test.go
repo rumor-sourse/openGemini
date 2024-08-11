@@ -456,6 +456,7 @@ func TestExporter_Export(t *testing.T) {
 			rpNameToWalFilesMap:             make(map[string][]string),
 			Stderr:                          os.Stderr,
 			Stdout:                          os.Stdout,
+			remoteExporter:                  NewRemoteExporter(),
 		}
 		clc := &CommandLineConfig{
 			Database:   "",
@@ -486,6 +487,7 @@ func TestExporter_Export(t *testing.T) {
 			rpNameToWalFilesMap:             make(map[string][]string),
 			Stderr:                          os.Stderr,
 			Stdout:                          os.Stdout,
+			remoteExporter:                  NewRemoteExporter(),
 		}
 		clc1 := &CommandLineConfig{
 			Database:   "",

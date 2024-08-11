@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/golang/snappy"
+	"github.com/influxdata/influxdb/client"
 	"github.com/openGemini/openGemini/engine"
 	"github.com/openGemini/openGemini/engine/immutable"
 	"github.com/openGemini/openGemini/engine/index/tsi"
@@ -34,13 +36,14 @@ import (
 )
 
 const (
-	tsspFileExtension = "tssp"
-	walFileExtension  = "wal"
-	csvFormatExporter = "csv"
-	txtFormatExporter = "txt"
-	dirNameSeparator  = "_"
-	stdOtuMark        = "-"
-	writerBufferSize  = 1024 * 1024
+	tsspFileExtension     = "tssp"
+	walFileExtension      = "wal"
+	csvFormatExporter     = "csv"
+	txtFormatExporter     = "txt"
+	remoteFormatExporter  = "remote"
+	dirNameSeparator      = "_"
+	writerBufferSize      = 1024 * 1024
+	batchRemoteExportSize = 5000
 )
 
 var (
@@ -257,6 +260,8 @@ type Exporter struct {
 	filter            *DataFilter
 	compress          bool
 	lineCount         uint64
+	remote            string
+	remoteExporter    *RemoteExporter
 	Parser
 
 	stderrLogger  *log.Logger
@@ -282,6 +287,7 @@ func NewExporter() *Exporter {
 		rpNameToMeasurementTsspFilesMap: make(map[string]map[string][]string),
 		rpNameToIdToIndexMap:            make(map[string]map[uint64]*tsi.MergeSetIndex),
 		rpNameToWalFilesMap:             make(map[string][]string),
+		remoteExporter:                  NewRemoteExporter(),
 
 		Stdout: os.Stdout,
 		Stderr: os.Stderr,
@@ -289,11 +295,6 @@ func NewExporter() *Exporter {
 		dataTotalCount: 0,
 		bar:            nil,
 	}
-}
-
-// usingStdOut return if this export task uses stdout to receive results.
-func (e *Exporter) usingStdOut() bool {
-	return e.outPutPath == stdOtuMark
 }
 
 // parseActualDir transforms user puts in datadir and waldir to actual dirs
@@ -380,26 +381,31 @@ func (e *Exporter) parseDatabaseInfos() error {
 
 // Init inits the Exporter instance ues CommandLineConfig specific by user
 func (e *Exporter) Init(clc *CommandLineConfig) error {
+	if clc.Format != "csv" && clc.Format != "txt" && clc.Format != "remote" {
+		return fmt.Errorf("unsupported export format %q", clc.Format)
+	}
+	if clc.Format != "remote" && clc.Out == "" {
+		return fmt.Errorf("execute -export cmd, not using remote format, --out is required")
+	}
+	if clc.Format == "remote" {
+		if err := e.remoteExporter.Init(clc); err != nil {
+			return err
+		}
+	}
+
 	e.exportFormat = clc.Format
-	if e.exportFormat == csvFormatExporter {
-		e.Parser = NewCsvParser()
-	} else if e.exportFormat == txtFormatExporter {
+	if e.exportFormat == txtFormatExporter || e.exportFormat == remoteFormatExporter {
 		e.Parser = NewTxtParser()
-	} else {
-		return fmt.Errorf("unsupported export format %q", e.exportFormat)
+	} else if e.exportFormat == csvFormatExporter {
+		e.Parser = NewCsvParser()
 	}
 	e.retentions = clc.Retentions
 	e.outPutPath = clc.Out
 	e.compress = clc.Compress
+	e.remote = clc.Remote
+	e.defaultLogger = e.stdoutLogger
 	// filter dbs, msts, time
 	e.filter = NewDataFilter()
-
-	// If output fd is stdout.
-	if e.usingStdOut() {
-		e.defaultLogger = e.stderrLogger
-	} else {
-		e.defaultLogger = e.stdoutLogger
-	}
 
 	e.filter.parseDatabases(clc.DBFilter)
 
@@ -483,8 +489,8 @@ func (e *Exporter) NewBar(total int) *mpb.Bar {
 
 // write writes data to output fd user specifics.
 func (e *Exporter) write() error {
-	var outputWriter io.Writer
-	if e.usingStdOut() {
+	var outputWriter, metaWriter io.Writer
+	if e.remoteExporter.isExist {
 		outputWriter = e.Stdout
 	} else {
 		outputFile, err := os.Create(e.outPutPath)
@@ -515,7 +521,11 @@ func (e *Exporter) write() error {
 	}
 
 	// metaWriter to write information that are not line-protocols
-	metaWriter := outputWriter
+	if e.remoteExporter.isExist {
+		metaWriter = os.Stdout
+	} else {
+		metaWriter = outputWriter
+	}
 
 	return e.writeFull(metaWriter, outputWriter)
 }
@@ -582,21 +592,24 @@ func (e *Exporter) updateDataTotalCount(path string) {
 	defer util.MustClose(f)
 	fi := immutable.NewFileIterator(f, immutable.CLog)
 	itr := immutable.NewChunkIterator(fi)
-	for {
-		if !itr.Next() {
-			break
-		}
-		rec := itr.GetRecord()
-		var recs []record.Record
-		recs = rec.Split(recs, 1)
-		for _, r := range recs {
-			tm := r.Times()[0]
-			if !e.filter.timeFilter(tm) {
-				continue
+	itr.NextChunkMeta()
+	/*
+		for {
+			if !itr.Next() {
+				break
 			}
-			e.dataTotalCount++
+			rec := itr.GetRecord()
+			var recs []record.Record
+			recs = rec.Split(recs, 1)
+			for _, r := range recs {
+				tm := r.Times()[0]
+				if !e.filter.timeFilter(tm) {
+					continue
+				}
+				e.dataTotalCount++
+			}
 		}
-	}
+	*/
 }
 
 func (e *Exporter) walkWalFile(dbDiskInfo *DatabaseDiskInfo) error {
@@ -662,11 +675,27 @@ func (e *Exporter) writeDDL(metaWriter io.Writer, outputWriter io.Writer) error 
 	for _, dbDiskInfo := range e.databaseDiskInfos {
 		avoidRepetition := map[string]struct{}{}
 		databaseName := dbDiskInfo.dbName
-		fmt.Fprintf(outputWriter, "CREATE DATABASE %s\n", databaseName)
+		if e.remoteExporter.isExist {
+			// write DDL to remote
+			command := fmt.Sprintf("CREATE DATABASE %s", databaseName)
+			if err := e.remoteExporter.processDDL(command); err != nil {
+				return err
+			}
+		} else {
+			fmt.Fprintf(outputWriter, "CREATE DATABASE %s\n", databaseName)
+		}
 		for ptWithRp := range dbDiskInfo.rps {
 			rpName := strings.Split(ptWithRp, ":")[1]
 			if _, ok := avoidRepetition[rpName]; !ok {
-				fmt.Fprintf(outputWriter, "CREATE RETENTION POLICY %s ON %s DURATION 0s REPLICATION 1\n", rpName, databaseName)
+				if e.remoteExporter.isExist {
+					// write DDL to remote
+					command := fmt.Sprintf("CREATE RETENTION POLICY %s ON %s DURATION 0s REPLICATION 1", rpName, databaseName)
+					if err := e.remoteExporter.processDDL(command); err != nil {
+						return err
+					}
+				} else {
+					fmt.Fprintf(outputWriter, "CREATE RETENTION POLICY %s ON %s DURATION 0s REPLICATION 1\n", rpName, databaseName)
+				}
 				avoidRepetition[rpName] = struct{}{}
 			}
 		}
@@ -687,12 +716,14 @@ func (e *Exporter) writeDML(metaWriter io.Writer, outputWriter io.Writer) error 
 			fmt.Fprintf(metaWriter, "# CONTEXT-DATABASE: %s\n\n", keySplits[0])
 			curDatabaseName = keySplits[0]
 		}
+		e.remoteExporter.database = curDatabaseName
 
 		// shardKeyToIndexMap stores all indexes for this "database:retention policy"
 		shardKeyToIndexMap, ok := e.rpNameToIdToIndexMap[key]
 		if !ok {
 			return fmt.Errorf("cant find rpNameToIdToIndexMap for %q", key)
 		}
+		e.remoteExporter.retentionPolicy = keySplits[1]
 
 		fmt.Fprintf(metaWriter, "# CONTEXT-RETENTION-POLICY: %s\n\n", keySplits[1])
 
@@ -700,6 +731,9 @@ func (e *Exporter) writeDML(metaWriter io.Writer, outputWriter io.Writer) error 
 		if measurementToTsspFileMap, ok := e.rpNameToMeasurementTsspFilesMap[key]; ok {
 			e.defaultLogger.Printf("writing out tssp file data for %s...\n", key)
 			if err := e.writeAllTsspFilesInRp(metaWriter, outputWriter, measurementToTsspFileMap, shardKeyToIndexMap); err != nil {
+				return err
+			}
+			if err := e.remoteExporter.batchRemoteExport(); err != nil {
 				return err
 			}
 			// progress.Wait()
@@ -856,8 +890,15 @@ func (e *Exporter) writeSingleRecord(outputWriter io.Writer, seriesKey [][]byte,
 	if err != nil {
 		return nil, err
 	}
-	if _, err := outputWriter.Write(buf); err != nil {
-		return buf, err
+	if e.remoteExporter.isExist {
+		// write DML to remote
+		if err := e.remoteExporter.processDML(string(buf)); err != nil {
+			return buf, err
+		}
+	} else {
+		if _, err := outputWriter.Write(buf); err != nil {
+			return buf, err
+		}
 	}
 	e.lineCount++
 	// e.bar.Increment()
@@ -1280,6 +1321,82 @@ func (C *CsvParser) WriteMstInfoFromTssp(metaWriter io.Writer, outputWriter io.W
 	return nil
 }
 
+type RemoteExporter struct {
+	isExist          bool
+	client           HttpClient
+	clientCreator    HttpClientCreator
+	database         string
+	retentionPolicy  string
+	precision        string
+	writeConsistency string
+	batch            []string
+}
+
+func NewRemoteExporter() *RemoteExporter {
+	return &RemoteExporter{
+		isExist:       false,
+		clientCreator: defaultHttpClientCreator,
+	}
+}
+
+func (re *RemoteExporter) Init(clc *CommandLineConfig) error {
+
+	if clc.Remote == "" {
+		return fmt.Errorf("execute -export cmd, using remote format, --remote is required")
+	}
+	re.isExist = true
+	config, err := parseRemoteClientConfig(clc)
+	if err != nil {
+		return err
+	}
+
+	// Create a new client and ping it.
+	cli, err := re.clientCreator(*config)
+	if err != nil {
+		return fmt.Errorf("could not create client %s", err)
+	}
+	re.client = cli
+	if _, _, err = re.client.Ping(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (re *RemoteExporter) processDDL(command string) error {
+	response, err := re.client.QueryContext(context.TODO(), client.Query{Command: command, Database: re.database})
+	if err != nil {
+		return err
+	}
+	if err = response.Error(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (re *RemoteExporter) processDML(command string) error {
+	re.batch = append(re.batch, command)
+	if len(re.batch) == batchRemoteExportSize {
+		if err := re.batchRemoteExport(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (re *RemoteExporter) batchRemoteExport() error {
+	if len(re.batch) == 0 {
+		return nil
+	}
+	resp, err := re.client.WriteLineProtocol(strings.Join(re.batch, "\n"), re.database, re.retentionPolicy, re.precision, re.writeConsistency)
+	if err != nil {
+		return fmt.Errorf("error writing command: %s", err)
+	} else if resp != nil && resp.Error() != nil {
+		return fmt.Errorf("error writing command: %s", resp.Error())
+	}
+	re.batch = re.batch[:0]
+	return nil
+}
+
 func parseShardDir(shardDirName string) (uint64, uint64, error) {
 	shardDir := strings.Split(shardDirName, dirNameSeparator)
 	if len(shardDir) != 4 {
@@ -1362,4 +1479,27 @@ func getFieldNameIndex(slice []record.Field, str string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// parseRemoteClientConfig initialize the client.config
+func parseRemoteClientConfig(clc *CommandLineConfig) (*client.Config, error) {
+	config := client.NewConfig()
+
+	u, err := parseConnectionString(clc.Remote)
+	if err != nil {
+		return nil, err
+	}
+	config.URL = u
+	config.URL.Host = clc.Remote
+
+	if clc.Precision, err = parsePrecision(clc.Precision); err != nil {
+		return nil, err
+	}
+	config.Precision = clc.Precision
+
+	config.UnixSocket = clc.UnixSocket
+	config.Username = clc.Username
+	config.Password = clc.Password
+	config.UnsafeSsl = clc.IgnoreSsl
+	return &config, nil
 }
